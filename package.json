@@ -1,0 +1,23 @@
+{
+  "name": "@logitropic/claude-app-server",
+  "version": "0.1.0",
+  "description": "Codex-style Rust app-server for the local Claude Code CLI.",
+  "license": "MIT",
+  "bin": {
+    "claude-app-server": "bin/claude-app-server.js"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "bin"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/logitropic/claude-app-server.git"
+  }
+}

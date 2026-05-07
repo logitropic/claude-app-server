@@ -363,6 +363,40 @@ Build:
 cargo build -p claude-app-server
 ```
 
+## npm Distribution
+
+The npm package follows Codex-style native distribution:
+
+- `@logitropic/claude-app-server` is a lightweight Node launcher.
+- Platform binaries are optional dependency aliases published as platform-tagged versions of the same npm package.
+- Native payloads live under `vendor/<target-triple>/claude-app-server/claude-app-server(.exe)`.
+
+Stage packages from a populated vendor tree:
+
+```bash
+python3 scripts/stage_npm_packages.py \
+  --release-version 0.1.0 \
+  --package claude-app-server \
+  --vendor-src dist/native/vendor \
+  --output-dir dist/npm
+```
+
+For local testing on the current machine:
+
+```bash
+cargo build --release -p claude-app-server
+TARGET_TRIPLE=aarch64-apple-darwin
+PLATFORM_PACKAGE=claude-app-server-darwin-arm64
+mkdir -p "dist/native/vendor/${TARGET_TRIPLE}/claude-app-server"
+cp target/release/claude-app-server \
+  "dist/native/vendor/${TARGET_TRIPLE}/claude-app-server/claude-app-server"
+python3 scripts/build_npm_package.py \
+  --package "${PLATFORM_PACKAGE}" \
+  --release-version 0.1.0 \
+  --vendor-src dist/native/vendor \
+  --pack-output "dist/npm/${PLATFORM_PACKAGE}-0.1.0.tgz"
+```
+
 ## Compatibility Notes
 
 This Rust implementation was smoke-tested against the TypeScript reference for:
