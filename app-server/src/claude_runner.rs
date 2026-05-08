@@ -2,31 +2,93 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use claude_app_server_protocol::AgentMessageDeltaNotification;
+use claude_app_server_protocol::DynamicToolCallOutputContentItem;
+use claude_app_server_protocol::DynamicToolCallStatus;
 use claude_app_server_protocol::Item;
-use claude_app_server_protocol::ItemCreatedNotification;
-use claude_app_server_protocol::ItemProgressNotification;
+use claude_app_server_protocol::ItemCompletedNotification;
+use claude_app_server_protocol::ItemStartedNotification;
+use claude_app_server_protocol::ReasoningTextDeltaNotification;
 use claude_app_server_protocol::ServerNotification;
+use claude_app_server_protocol::ThreadItem;
+use claude_app_server_protocol::ThreadStartedNotification;
+use claude_app_server_protocol::ThreadTokenUsageUpdatedNotification;
+use claude_app_server_protocol::TokenUsageBreakdown;
 use claude_app_server_protocol::TurnCompletedNotification;
-use claude_app_server_protocol::TurnFailedNotification;
 use claude_app_server_protocol::TurnPermissionDeniedNotification;
 use claude_app_server_protocol::TurnStatus;
-use claude_app_server_protocol::UsageUpdateNotification;
 use claude_app_server_transport::OutgoingMessage;
 use serde::Deserialize;
 use serde_json::Value;
-use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::outgoing_message::OutboundControlEvent;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::thread_state::ThreadStore;
 use crate::thread_state::now_millis;
+
+#[derive(Debug, Default, Clone)]
+struct ClaudeStreamState {
+    usage: Option<ClaudeUsageSnapshot>,
+    last_total_tokens: Option<i64>,
+    context_window_size: i64,
+    active_blocks: HashMap<usize, ActiveStreamBlock>,
+    pending_tool_calls: HashMap<String, PendingToolCall>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveStreamBlock {
+    item_id: String,
+    kind: ActiveStreamBlockKind,
+}
+
+#[derive(Debug, Clone)]
+enum ActiveStreamBlockKind {
+    AgentMessage {
+        text: String,
+    },
+    Reasoning {
+        thinking: String,
+    },
+    ToolUse {
+        tool_use_id: String,
+        name: String,
+        input: Value,
+        input_json_delta: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    item_id: String,
+    name: String,
+    input: Value,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ClaudeUsageSnapshot {
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_input_tokens: i64,
+    cache_creation_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+impl ClaudeUsageSnapshot {
+    fn total_tokens(&self) -> i64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cached_input_tokens
+            + self.cache_creation_input_tokens
+    }
+}
 
 #[derive(Clone)]
 pub struct ClaudeRunner {
@@ -54,25 +116,28 @@ impl ClaudeRunner {
     pub async fn run_turn(self, store: ThreadStore, args: RunTurnArgs) {
         let result = self.run_turn_inner(store.clone(), &args).await;
         if let Err(err) = result {
-            let _ = store
+            let completed = store
                 .with_thread_mut(&args.thread_id, |thread| {
+                    let thread_id = thread.id.clone();
                     if let Some(turn) = thread.active_turn_mut() {
-                        turn.status = TurnStatus::Error;
+                        turn.status = TurnStatus::Failed;
                         turn.error = Some(err.to_string());
                         turn.completed_at = Some(now_millis());
+                        let notification = TurnCompletedNotification {
+                            thread_id,
+                            turn: turn.snapshot(),
+                        };
+                        thread.active_turn_id = None;
+                        return Some(notification);
                     }
-                    thread.active_turn_id = None;
+                    None
                 })
-                .await;
-            self.notify(
-                args.connection_id,
-                "turn/failed",
-                TurnFailedNotification {
-                    turn_id: args.turn_id,
-                    error: err.to_string(),
-                },
-            )
-            .await;
+                .await
+                .flatten();
+            if let Some(notification) = completed {
+                self.notify(args.connection_id, "turn/completed", notification)
+                    .await;
+            }
         }
     }
 
@@ -178,8 +243,10 @@ impl ClaudeRunner {
             let _ = child_for_cancel.lock().await.kill().await;
         });
 
-        let mut partial_text: HashMap<String, String> = HashMap::new();
-        let mut partial_thinking: HashMap<String, String> = HashMap::new();
+        let mut stream_state = ClaudeStreamState {
+            context_window_size: 200_000,
+            ..ClaudeStreamState::default()
+        };
         let mut lines = BufReader::new(stdout).lines();
         while let Some(line) = lines.next_line().await? {
             let trimmed = line.trim();
@@ -198,8 +265,7 @@ impl ClaudeRunner {
                 &args.turn_id,
                 args.connection_id,
                 event,
-                &mut partial_text,
-                &mut partial_thinking,
+                &mut stream_state,
             )
             .await?;
         }
@@ -229,13 +295,8 @@ impl ClaudeRunner {
                 };
                 turn.completed_at = Some(now_millis());
                 let notification = TurnCompletedNotification {
-                    turn_id: turn.id.clone(),
                     thread_id: notification_thread_id,
-                    status: turn.status.clone(),
-                    items_count: turn.items.len(),
-                    completed_at: turn.completed_at.unwrap_or_default(),
-                    usage: turn.usage.clone(),
-                    cost_usd: turn.cost_usd,
+                    turn: turn.snapshot(),
                 };
                 thread.active_turn_id = None;
                 Some(notification)
@@ -257,8 +318,7 @@ impl ClaudeRunner {
         turn_id: &str,
         connection_id: claude_app_server_transport::ConnectionId,
         event: ClaudeStreamEvent,
-        partial_text: &mut HashMap<String, String>,
-        partial_thinking: &mut HashMap<String, String>,
+        stream_state: &mut ClaudeStreamState,
     ) -> anyhow::Result<()> {
         match event {
             ClaudeStreamEvent::System {
@@ -269,127 +329,21 @@ impl ClaudeRunner {
                 if subtype == "init"
                     && let Some(session_id) = session_id
                 {
-                    let _ = store
+                    let notification = store
                         .with_thread_mut(thread_id, |thread| {
                             thread.cli_session_id = Some(session_id);
+                            ThreadStartedNotification {
+                                thread: thread.snapshot(),
+                            }
                         })
                         .await;
-                }
-            }
-            ClaudeStreamEvent::Assistant {
-                message,
-                is_partial,
-                ..
-            } => {
-                let msg_id = message.id.unwrap_or_else(|| "unknown".to_string());
-                let partial = is_partial.unwrap_or(false);
-                for block in message.content.unwrap_or_default() {
-                    match block {
-                        ClaudeContentBlock::Text { text } => {
-                            let prev = partial_text.get(&msg_id).cloned().unwrap_or_default();
-                            let delta = text.strip_prefix(&prev).unwrap_or(&text).to_string();
-                            if !delta.is_empty() {
-                                self.notify(
-                                    connection_id,
-                                    "item/progress",
-                                    ItemProgressNotification {
-                                        turn_id: turn_id.to_string(),
-                                        delta: json!({ "type": "text", "text": delta }),
-                                    },
-                                )
-                                .await;
-                                partial_text.insert(msg_id.clone(), text.clone());
-                            }
-                            if !partial {
-                                let created = store
-                                    .with_thread_mut(thread_id, |thread| {
-                                        thread
-                                            .active_turn_mut()
-                                            .map(|turn| turn.push_item(Item::Text { text }))
-                                    })
-                                    .await
-                                    .flatten();
-                                if let Some(item) = created {
-                                    self.notify(
-                                        connection_id,
-                                        "item/created",
-                                        ItemCreatedNotification {
-                                            turn_id: turn_id.to_string(),
-                                            item,
-                                        },
-                                    )
-                                    .await;
-                                }
-                                partial_text.remove(&msg_id);
-                            }
-                        }
-                        ClaudeContentBlock::Thinking { thinking } if !partial => {
-                            let prev = partial_thinking.get(&msg_id).cloned().unwrap_or_default();
-                            let delta = thinking
-                                .strip_prefix(&prev)
-                                .unwrap_or(&thinking)
-                                .to_string();
-                            if !delta.is_empty() {
-                                self.notify(
-                                    connection_id,
-                                    "item/progress",
-                                    ItemProgressNotification {
-                                        turn_id: turn_id.to_string(),
-                                        delta: json!({ "type": "thinking", "thinking": delta }),
-                                    },
-                                )
-                                .await;
-                            }
-                            let created = store
-                                .with_thread_mut(thread_id, |thread| {
-                                    thread
-                                        .active_turn_mut()
-                                        .map(|turn| turn.push_item(Item::Thinking { thinking }))
-                                })
-                                .await
-                                .flatten();
-                            if let Some(item) = created {
-                                self.notify(
-                                    connection_id,
-                                    "item/created",
-                                    ItemCreatedNotification {
-                                        turn_id: turn_id.to_string(),
-                                        item,
-                                    },
-                                )
-                                .await;
-                            }
-                            partial_thinking.remove(&msg_id);
-                        }
-                        ClaudeContentBlock::ToolUse { id, name, input } if !partial => {
-                            let created = store
-                                .with_thread_mut(thread_id, |thread| {
-                                    thread.active_turn_mut().map(|turn| {
-                                        turn.push_item(Item::ToolCall {
-                                            tool_use_id: id,
-                                            name,
-                                            input: input.unwrap_or(Value::Null),
-                                        })
-                                    })
-                                })
-                                .await
-                                .flatten();
-                            if let Some(item) = created {
-                                self.notify(
-                                    connection_id,
-                                    "item/created",
-                                    ItemCreatedNotification {
-                                        turn_id: turn_id.to_string(),
-                                        item,
-                                    },
-                                )
-                                .await;
-                            }
-                        }
-                        _ => {}
+                    if let Some(notification) = notification {
+                        self.notify(connection_id, "thread/started", notification)
+                            .await;
                     }
                 }
             }
+            ClaudeStreamEvent::Assistant { .. } => {}
             ClaudeStreamEvent::User { message, .. } => {
                 for block in message.content.unwrap_or_default() {
                     if let ClaudeContentBlock::ToolResult {
@@ -411,25 +365,68 @@ impl ClaudeRunner {
                             Some(value) => value.to_string(),
                             None => String::new(),
                         };
+                        let is_error = is_error.unwrap_or(false);
                         let created = store
                             .with_thread_mut(thread_id, |thread| {
                                 thread.active_turn_mut().map(|turn| {
                                     turn.push_item(Item::ToolResult {
-                                        tool_use_id,
-                                        content,
-                                        is_error: is_error.unwrap_or(false),
+                                        tool_use_id: tool_use_id.clone(),
+                                        content: content.clone(),
+                                        is_error,
                                     })
                                 })
                             })
                             .await
                             .flatten();
-                        if let Some(item) = created {
+                        if created.is_some() {
+                            let pending = stream_state.pending_tool_calls.remove(&tool_use_id);
+                            let item = if let Some(pending) = pending {
+                                ThreadItem::DynamicToolCall {
+                                    id: pending.item_id,
+                                    namespace: None,
+                                    tool: pending.name,
+                                    arguments: pending.input,
+                                    status: if is_error {
+                                        DynamicToolCallStatus::Failed
+                                    } else {
+                                        DynamicToolCallStatus::Completed
+                                    },
+                                    content_items: Some(vec![
+                                        DynamicToolCallOutputContentItem::InputText {
+                                            text: content,
+                                        },
+                                    ]),
+                                    success: Some(!is_error),
+                                    duration_ms: None,
+                                }
+                            } else {
+                                ThreadItem::DynamicToolCall {
+                                    id: Uuid::now_v7().to_string(),
+                                    namespace: None,
+                                    tool: tool_use_id,
+                                    arguments: Value::Null,
+                                    status: if is_error {
+                                        DynamicToolCallStatus::Failed
+                                    } else {
+                                        DynamicToolCallStatus::Completed
+                                    },
+                                    content_items: Some(vec![
+                                        DynamicToolCallOutputContentItem::InputText {
+                                            text: content,
+                                        },
+                                    ]),
+                                    success: Some(!is_error),
+                                    duration_ms: None,
+                                }
+                            };
                             self.notify(
                                 connection_id,
-                                "item/created",
-                                ItemCreatedNotification {
+                                "item/completed",
+                                ItemCompletedNotification {
+                                    thread_id: thread_id.to_string(),
                                     turn_id: turn_id.to_string(),
                                     item,
+                                    completed_at_ms: now_millis(),
                                 },
                             )
                             .await;
@@ -437,30 +434,292 @@ impl ClaudeRunner {
                     }
                 }
             }
-            ClaudeStreamEvent::StreamEvent { event, .. } => {
-                if event.event_type == "message_delta"
-                    && let Some(mut usage) = event.usage
-                {
-                    add_total_tokens(&mut usage);
-                    let _ = store
-                        .with_thread_mut(thread_id, |thread| {
-                            if let Some(turn) = thread.active_turn_mut() {
-                                turn.usage = Some(usage.clone());
-                            }
-                        })
+            ClaudeStreamEvent::StreamEvent { event, .. } => match event {
+                ClaudeInnerStreamEvent::MessageStart { message } => {
+                    stream_state.usage = None;
+                    stream_state.last_total_tokens = None;
+                    if let Some(model) = message.model.as_deref()
+                        && let Some(inferred) = infer_context_window_from_model(model)
+                    {
+                        stream_state.context_window_size = inferred;
+                    }
+                    if let Some(usage_value) = message.usage.as_ref()
+                        && let Some(token_breakdown) =
+                            update_token_usage_snapshot(stream_state, usage_value)
+                    {
+                        self.notify(
+                            connection_id,
+                            "thread/tokenUsage/updated",
+                            ThreadTokenUsageUpdatedNotification {
+                                thread_id: thread_id.to_string(),
+                                turn_id: turn_id.to_string(),
+                                token_usage: claude_app_server_protocol::ThreadTokenUsage {
+                                    total: token_breakdown.clone(),
+                                    last: token_breakdown,
+                                    model_context_window: Some(stream_state.context_window_size),
+                                },
+                            },
+                        )
                         .await;
-                    self.notify(
-                        connection_id,
-                        "usage/update",
-                        UsageUpdateNotification {
-                            turn_id: turn_id.to_string(),
-                            thread_id: thread_id.to_string(),
-                            usage,
-                        },
-                    )
-                    .await;
+                    }
                 }
-            }
+                ClaudeInnerStreamEvent::MessageDelta { usage } => {
+                    if let Some(usage_value) = usage
+                        && let Some(token_breakdown) =
+                            update_token_usage_snapshot(stream_state, &usage_value)
+                    {
+                        self.notify(
+                            connection_id,
+                            "thread/tokenUsage/updated",
+                            ThreadTokenUsageUpdatedNotification {
+                                thread_id: thread_id.to_string(),
+                                turn_id: turn_id.to_string(),
+                                token_usage: claude_app_server_protocol::ThreadTokenUsage {
+                                    total: token_breakdown.clone(),
+                                    last: token_breakdown,
+                                    model_context_window: Some(stream_state.context_window_size),
+                                },
+                            },
+                        )
+                        .await;
+                    }
+                }
+                ClaudeInnerStreamEvent::ContentBlockStart {
+                    index,
+                    content_block,
+                } => {
+                    let item_id = Uuid::now_v7().to_string();
+                    let (item, block) = match content_block {
+                        ClaudeContentBlock::Text { text } => (
+                            Some(ThreadItem::AgentMessage {
+                                id: item_id.clone(),
+                                text: text.clone(),
+                                phase: None,
+                                memory_citation: None,
+                            }),
+                            Some(ActiveStreamBlock {
+                                item_id,
+                                kind: ActiveStreamBlockKind::AgentMessage { text },
+                            }),
+                        ),
+                        ClaudeContentBlock::Thinking { thinking } => (
+                            Some(ThreadItem::Reasoning {
+                                id: item_id.clone(),
+                                summary: Vec::new(),
+                                content: if thinking.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![thinking.clone()]
+                                },
+                            }),
+                            Some(ActiveStreamBlock {
+                                item_id,
+                                kind: ActiveStreamBlockKind::Reasoning { thinking },
+                            }),
+                        ),
+                        ClaudeContentBlock::ToolUse { id, name, input } => {
+                            let input = input.unwrap_or(Value::Null);
+                            (
+                                Some(ThreadItem::DynamicToolCall {
+                                    id: item_id.clone(),
+                                    namespace: None,
+                                    tool: name.clone(),
+                                    arguments: input.clone(),
+                                    status: DynamicToolCallStatus::InProgress,
+                                    content_items: None,
+                                    success: None,
+                                    duration_ms: None,
+                                }),
+                                Some(ActiveStreamBlock {
+                                    item_id,
+                                    kind: ActiveStreamBlockKind::ToolUse {
+                                        tool_use_id: id,
+                                        name,
+                                        input,
+                                        input_json_delta: String::new(),
+                                    },
+                                }),
+                            )
+                        }
+                        ClaudeContentBlock::ToolResult { .. } => (None, None),
+                    };
+                    if let Some(block) = block {
+                        stream_state.active_blocks.insert(index, block);
+                    }
+                    if let Some(item) = item {
+                        self.notify(
+                            connection_id,
+                            "item/started",
+                            ItemStartedNotification {
+                                item,
+                                thread_id: thread_id.to_string(),
+                                turn_id: turn_id.to_string(),
+                                started_at_ms: now_millis(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+                ClaudeInnerStreamEvent::ContentBlockDelta { index, delta } => {
+                    let Some(active_block) = stream_state.active_blocks.get_mut(&index) else {
+                        return Ok(());
+                    };
+                    match &mut active_block.kind {
+                        ActiveStreamBlockKind::AgentMessage { text } => {
+                            if let Some(delta_text) = delta.get("text").and_then(Value::as_str) {
+                                text.push_str(delta_text);
+                                self.notify(
+                                    connection_id,
+                                    "item/agentMessage/delta",
+                                    AgentMessageDeltaNotification {
+                                        thread_id: thread_id.to_string(),
+                                        turn_id: turn_id.to_string(),
+                                        item_id: active_block.item_id.clone(),
+                                        delta: delta_text.to_string(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        ActiveStreamBlockKind::Reasoning { thinking } => {
+                            if let Some(delta_text) = delta.get("thinking").and_then(Value::as_str)
+                            {
+                                thinking.push_str(delta_text);
+                                self.notify(
+                                    connection_id,
+                                    "item/reasoningText/delta",
+                                    ReasoningTextDeltaNotification {
+                                        thread_id: thread_id.to_string(),
+                                        turn_id: turn_id.to_string(),
+                                        item_id: active_block.item_id.clone(),
+                                        delta: delta_text.to_string(),
+                                        content_index: 0,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        ActiveStreamBlockKind::ToolUse {
+                            input_json_delta, ..
+                        } => {
+                            if let Some(partial_json) =
+                                delta.get("partial_json").and_then(Value::as_str)
+                            {
+                                input_json_delta.push_str(partial_json);
+                            }
+                        }
+                    }
+                }
+                ClaudeInnerStreamEvent::ContentBlockStop { index } => {
+                    let Some(active_block) = stream_state.active_blocks.remove(&index) else {
+                        return Ok(());
+                    };
+                    match active_block.kind {
+                        ActiveStreamBlockKind::AgentMessage { text } => {
+                            let item_id = active_block.item_id;
+                            let item = ThreadItem::AgentMessage {
+                                id: item_id.clone(),
+                                text: text.clone(),
+                                phase: None,
+                                memory_citation: None,
+                            };
+                            let created = store
+                                .with_thread_mut(thread_id, |thread| {
+                                    thread.active_turn_mut().map(|turn| {
+                                        turn.push_item_with_id(item_id, Item::Text { text })
+                                    })
+                                })
+                                .await
+                                .flatten();
+                            if created.is_some() {
+                                self.notify(
+                                    connection_id,
+                                    "item/completed",
+                                    ItemCompletedNotification {
+                                        item,
+                                        thread_id: thread_id.to_string(),
+                                        turn_id: turn_id.to_string(),
+                                        completed_at_ms: now_millis(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        ActiveStreamBlockKind::Reasoning { thinking } => {
+                            let item_id = active_block.item_id;
+                            let item = ThreadItem::Reasoning {
+                                id: item_id.clone(),
+                                summary: Vec::new(),
+                                content: if thinking.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![thinking.clone()]
+                                },
+                            };
+                            let created = store
+                                .with_thread_mut(thread_id, |thread| {
+                                    thread.active_turn_mut().map(|turn| {
+                                        turn.push_item_with_id(item_id, Item::Thinking { thinking })
+                                    })
+                                })
+                                .await
+                                .flatten();
+                            if created.is_some() {
+                                self.notify(
+                                    connection_id,
+                                    "item/completed",
+                                    ItemCompletedNotification {
+                                        item,
+                                        thread_id: thread_id.to_string(),
+                                        turn_id: turn_id.to_string(),
+                                        completed_at_ms: now_millis(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        ActiveStreamBlockKind::ToolUse {
+                            tool_use_id,
+                            name,
+                            input,
+                            input_json_delta,
+                        } => {
+                            let item_id = active_block.item_id;
+                            let input = if input_json_delta.is_empty() {
+                                input
+                            } else {
+                                serde_json::from_str(&input_json_delta).unwrap_or(input)
+                            };
+                            let created = store
+                                .with_thread_mut(thread_id, |thread| {
+                                    thread.active_turn_mut().map(|turn| {
+                                        turn.push_item_with_id(
+                                            item_id.clone(),
+                                            Item::ToolCall {
+                                                tool_use_id: tool_use_id.clone(),
+                                                name: name.clone(),
+                                                input: input.clone(),
+                                            },
+                                        )
+                                    })
+                                })
+                                .await
+                                .flatten();
+                            if created.is_some() {
+                                stream_state.pending_tool_calls.insert(
+                                    tool_use_id,
+                                    PendingToolCall {
+                                        item_id,
+                                        name,
+                                        input,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                ClaudeInnerStreamEvent::MessageStop => {}
+            },
             ClaudeStreamEvent::Result {
                 subtype,
                 session_id,
@@ -479,7 +738,7 @@ impl ClaudeRunner {
                         }
                         if let Some(turn) = thread.active_turn_mut() {
                             if subtype == "error" {
-                                turn.status = TurnStatus::Error;
+                                turn.status = TurnStatus::Failed;
                                 turn.error = error;
                             }
                             if let Some(mut usage) = usage {
@@ -531,19 +790,70 @@ impl ClaudeRunner {
 }
 
 fn add_total_tokens(usage: &mut Value) {
+    let total = usage_snapshot_from_value(usage, None).total_tokens();
     let Some(object) = usage.as_object_mut() else {
         return;
     };
-    let total = [
-        "input_tokens",
-        "output_tokens",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-    ]
-    .iter()
-    .filter_map(|key| object.get(*key).and_then(Value::as_i64))
-    .sum::<i64>();
     object.insert("total_tokens".to_string(), Value::from(total));
+}
+
+fn update_token_usage_snapshot(
+    stream_state: &mut ClaudeStreamState,
+    usage: &Value,
+) -> Option<TokenUsageBreakdown> {
+    let snapshot = usage_snapshot_from_value(usage, stream_state.usage.as_ref());
+    let total_tokens = snapshot.total_tokens();
+    if stream_state.last_total_tokens == Some(total_tokens) {
+        stream_state.usage = Some(snapshot);
+        return None;
+    }
+    stream_state.last_total_tokens = Some(total_tokens);
+    stream_state.usage = Some(snapshot.clone());
+    Some(TokenUsageBreakdown {
+        total_tokens,
+        input_tokens: snapshot.input_tokens,
+        cached_input_tokens: snapshot.cached_input_tokens,
+        output_tokens: snapshot.output_tokens,
+        reasoning_output_tokens: snapshot.reasoning_output_tokens,
+    })
+}
+
+fn usage_snapshot_from_value(
+    usage: &Value,
+    previous: Option<&ClaudeUsageSnapshot>,
+) -> ClaudeUsageSnapshot {
+    let empty_map = serde_json::Map::new();
+    let obj = usage.as_object().unwrap_or(&empty_map);
+    let previous = previous.cloned().unwrap_or_default();
+    ClaudeUsageSnapshot {
+        input_tokens: obj
+            .get("input_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(previous.input_tokens),
+        output_tokens: obj
+            .get("output_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(previous.output_tokens),
+        cached_input_tokens: obj
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(previous.cached_input_tokens),
+        cache_creation_input_tokens: obj
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(previous.cache_creation_input_tokens),
+        reasoning_output_tokens: obj
+            .get("reasoning_output_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(previous.reasoning_output_tokens),
+    }
+}
+
+fn infer_context_window_from_model(model: &str) -> Option<i64> {
+    model
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part.eq_ignore_ascii_case("1m"))
+        .then_some(1_000_000)
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,10 +865,7 @@ enum ClaudeStreamEvent {
         session_id: Option<String>,
     },
     #[serde(rename = "assistant")]
-    Assistant {
-        message: ClaudeMessage,
-        is_partial: Option<bool>,
-    },
+    Assistant {},
     #[serde(rename = "user")]
     User { message: ClaudeMessage },
     #[serde(rename = "stream_event")]
@@ -578,8 +885,34 @@ enum ClaudeStreamEvent {
 }
 
 #[derive(Debug, Deserialize)]
+struct ClaudeMessageStart {
+    model: Option<String>,
+    usage: Option<Value>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ClaudeInnerStreamEvent {
+    #[serde(rename = "message_start")]
+    MessageStart { message: ClaudeMessageStart },
+    #[serde(rename = "message_delta")]
+    MessageDelta { usage: Option<Value> },
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart {
+        index: usize,
+        content_block: ClaudeContentBlock,
+    },
+    #[serde(rename = "content_block_delta")]
+    ContentBlockDelta { index: usize, delta: Value },
+    #[serde(rename = "content_block_stop")]
+    ContentBlockStop { index: usize },
+    #[serde(rename = "message_stop")]
+    MessageStop,
+}
+
+#[derive(Debug, Deserialize)]
 struct ClaudeMessage {
-    id: Option<String>,
     content: Option<Vec<ClaudeContentBlock>>,
 }
 
@@ -604,9 +937,315 @@ enum ClaudeContentBlock {
     },
 }
 
-#[derive(Debug, Deserialize)]
-struct ClaudeInnerStreamEvent {
-    #[serde(rename = "type")]
-    event_type: String,
-    usage: Option<Value>,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claude_app_server_protocol::PermissionMode;
+    use claude_app_server_transport::ConnectionId;
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    async fn collect_jsonrpc_notification(
+        rx: &mut mpsc::Receiver<OutboundControlEvent>,
+    ) -> claude_app_server_protocol::JSONRPCNotification {
+        let event = rx.recv().await.expect("expected notification");
+        let OutboundControlEvent::Envelope(OutgoingEnvelope::ToConnection {
+            message: OutgoingMessage::AppServerNotification(notification),
+            ..
+        }) = event
+        else {
+            panic!("unexpected outbound event");
+        };
+        notification.into_jsonrpc()
+    }
+
+    async fn make_runner() -> (
+        ClaudeRunner,
+        ThreadStore,
+        mpsc::Receiver<OutboundControlEvent>,
+        String,
+        String,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        let runner = ClaudeRunner::new(PathBuf::from("claude"), false, tx);
+        let store = ThreadStore::default();
+        let thread =
+            crate::thread_state::ThreadState::new(PathBuf::from("/tmp"), PermissionMode::Default);
+        let thread_id = thread.id.clone();
+        let turn = crate::thread_state::TurnState::new(thread.id.clone(), "hello".to_string());
+        let turn_id = turn.id.clone();
+        let mut thread = thread;
+        thread.active_turn_id = Some(turn_id.clone());
+        thread.turns.push(turn);
+        store.insert(thread).await;
+        (runner, store, rx, thread_id, turn_id)
+    }
+
+    #[tokio::test]
+    async fn message_stream_updates_token_usage() {
+        let (runner, store, mut rx, thread_id, turn_id) = make_runner().await;
+        let mut state = ClaudeStreamState {
+            context_window_size: 200_000,
+            ..ClaudeStreamState::default()
+        };
+
+        runner
+            .process_claude_event(
+                &store,
+                &thread_id,
+                &turn_id,
+                ConnectionId(1),
+                ClaudeStreamEvent::StreamEvent {
+                    event: ClaudeInnerStreamEvent::MessageStart {
+                        message: ClaudeMessageStart {
+                            model: Some("claude-opus-4-6-1m".to_string()),
+                            usage: Some(serde_json::json!({
+                                "input_tokens": 1000,
+                                "output_tokens": 0,
+                                "cache_read_input_tokens": 200,
+                                "cache_creation_input_tokens": 100
+                            })),
+                        },
+                    },
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        let notification = collect_jsonrpc_notification(&mut rx).await;
+        assert_eq!(notification.method, "thread/tokenUsage/updated");
+        let params = notification.params.expect("params");
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(
+            params.get("turnId").and_then(Value::as_str),
+            Some(turn_id.as_str())
+        );
+        assert_eq!(
+            params["tokenUsage"]["total"]["totalTokens"].as_i64(),
+            Some(1300)
+        );
+        assert_eq!(
+            params["tokenUsage"]["modelContextWindow"].as_i64(),
+            Some(1_000_000)
+        );
+
+        runner
+            .process_claude_event(
+                &store,
+                &thread_id,
+                &turn_id,
+                ConnectionId(1),
+                ClaudeStreamEvent::StreamEvent {
+                    event: ClaudeInnerStreamEvent::MessageDelta {
+                        usage: Some(serde_json::json!({
+                            "output_tokens": 500
+                        })),
+                    },
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        let notification = collect_jsonrpc_notification(&mut rx).await;
+        assert_eq!(notification.method, "thread/tokenUsage/updated");
+        let params = notification.params.expect("params");
+        assert_eq!(
+            params["tokenUsage"]["total"]["totalTokens"].as_i64(),
+            Some(1800)
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_use_block_emits_item_started() {
+        let (runner, store, mut rx, thread_id, turn_id) = make_runner().await;
+        let mut state = ClaudeStreamState {
+            context_window_size: 200_000,
+            ..ClaudeStreamState::default()
+        };
+
+        runner
+            .process_claude_event(
+                &store,
+                &thread_id,
+                &turn_id,
+                ConnectionId(1),
+                ClaudeStreamEvent::StreamEvent {
+                    event: ClaudeInnerStreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ClaudeContentBlock::ToolUse {
+                            id: "tool_1".to_string(),
+                            name: "Bash".to_string(),
+                            input: Some(serde_json::json!({"command":"echo hi"})),
+                        },
+                    },
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        let notification = collect_jsonrpc_notification(&mut rx).await;
+        assert_eq!(notification.method, "item/started");
+        let params = notification.params.expect("params");
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(
+            params.get("turnId").and_then(Value::as_str),
+            Some(turn_id.as_str())
+        );
+        assert_eq!(
+            params
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str),
+            Some("dynamicToolCall")
+        );
+    }
+
+    #[tokio::test]
+    async fn text_block_emits_codex_delta_and_completed_item() {
+        let (runner, store, mut rx, thread_id, turn_id) = make_runner().await;
+        let mut state = ClaudeStreamState {
+            context_window_size: 200_000,
+            ..ClaudeStreamState::default()
+        };
+
+        runner
+            .process_claude_event(
+                &store,
+                &thread_id,
+                &turn_id,
+                ConnectionId(1),
+                ClaudeStreamEvent::StreamEvent {
+                    event: ClaudeInnerStreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ClaudeContentBlock::Text {
+                            text: String::new(),
+                        },
+                    },
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        let started = collect_jsonrpc_notification(&mut rx).await;
+        assert_eq!(started.method, "item/started");
+        let started_params = started.params.expect("params");
+        let item_id = started_params["item"]["id"]
+            .as_str()
+            .expect("item id")
+            .to_string();
+
+        runner
+            .process_claude_event(
+                &store,
+                &thread_id,
+                &turn_id,
+                ConnectionId(1),
+                ClaudeStreamEvent::StreamEvent {
+                    event: ClaudeInnerStreamEvent::ContentBlockDelta {
+                        index: 0,
+                        delta: serde_json::json!({
+                            "type": "text_delta",
+                            "text": "hello"
+                        }),
+                    },
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        let delta = collect_jsonrpc_notification(&mut rx).await;
+        assert_eq!(delta.method, "item/agentMessage/delta");
+        let delta_params = delta.params.expect("params");
+        assert_eq!(delta_params["itemId"].as_str(), Some(item_id.as_str()));
+        assert_eq!(delta_params["delta"].as_str(), Some("hello"));
+
+        runner
+            .process_claude_event(
+                &store,
+                &thread_id,
+                &turn_id,
+                ConnectionId(1),
+                ClaudeStreamEvent::StreamEvent {
+                    event: ClaudeInnerStreamEvent::ContentBlockStop { index: 0 },
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        let completed = collect_jsonrpc_notification(&mut rx).await;
+        assert_eq!(completed.method, "item/completed");
+        let completed_params = completed.params.expect("params");
+        assert_eq!(
+            completed_params["item"]["id"].as_str(),
+            Some(item_id.as_str())
+        );
+        assert_eq!(completed_params["item"]["text"].as_str(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_usage_snapshot_is_deduped() {
+        let (runner, store, mut rx, thread_id, turn_id) = make_runner().await;
+        let mut state = ClaudeStreamState {
+            context_window_size: 200_000,
+            ..ClaudeStreamState::default()
+        };
+
+        runner
+            .process_claude_event(
+                &store,
+                &thread_id,
+                &turn_id,
+                ConnectionId(1),
+                ClaudeStreamEvent::StreamEvent {
+                    event: ClaudeInnerStreamEvent::MessageStart {
+                        message: ClaudeMessageStart {
+                            model: Some("claude-opus-4-20250514".to_string()),
+                            usage: Some(serde_json::json!({
+                                "input_tokens": 1000,
+                                "output_tokens": 0,
+                                "cache_read_input_tokens": 200,
+                                "cache_creation_input_tokens": 100
+                            })),
+                        },
+                    },
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        let _ = collect_jsonrpc_notification(&mut rx).await;
+
+        runner
+            .process_claude_event(
+                &store,
+                &thread_id,
+                &turn_id,
+                ConnectionId(1),
+                ClaudeStreamEvent::StreamEvent {
+                    event: ClaudeInnerStreamEvent::MessageDelta {
+                        usage: Some(serde_json::json!({
+                            "output_tokens": 0
+                        })),
+                    },
+                },
+                &mut state,
+            )
+            .await
+            .unwrap();
+
+        assert!(rx.try_recv().is_err());
+    }
 }

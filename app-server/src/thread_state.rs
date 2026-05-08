@@ -9,6 +9,8 @@ use claude_app_server_protocol::PermissionMode;
 use claude_app_server_protocol::StoredItem;
 use claude_app_server_protocol::Thread;
 use claude_app_server_protocol::Turn;
+use claude_app_server_protocol::TurnError;
+use claude_app_server_protocol::TurnItemsView;
 use claude_app_server_protocol::TurnStatus;
 use tokio::process::Child;
 use tokio::sync::Mutex;
@@ -115,7 +117,7 @@ impl TurnState {
         Self {
             id: Uuid::now_v7().to_string(),
             thread_id,
-            status: TurnStatus::Active,
+            status: TurnStatus::InProgress,
             user_content,
             steer_queue: Vec::new(),
             items: Vec::new(),
@@ -132,19 +134,36 @@ impl TurnState {
     pub fn snapshot(&self) -> Turn {
         Turn {
             id: self.id.clone(),
-            thread_id: self.thread_id.clone(),
+            items: self.items.iter().map(StoredItem::to_thread_item).collect(),
+            items_view: TurnItemsView::Full,
             status: self.status.clone(),
-            user_content: Some(self.user_content.clone()),
-            items: self.items.clone(),
-            created_at: self.created_at,
-            completed_at: self.completed_at,
-            error: self.error.clone(),
+            error: self.error.clone().map(|message| TurnError {
+                message,
+                codex_error_info: None,
+                additional_details: None,
+            }),
+            started_at: Some((self.created_at / 1000) as i64),
+            completed_at: self.completed_at.map(|ts| (ts / 1000) as i64),
+            duration_ms: self
+                .completed_at
+                .and_then(|completed| completed.checked_sub(self.created_at))
+                .map(|duration| duration as i64),
         }
     }
 
     pub fn push_item(&mut self, item: Item) -> StoredItem {
         let stored = StoredItem {
             id: Uuid::now_v7().to_string(),
+            created_at: now_millis(),
+            item,
+        };
+        self.items.push(stored.clone());
+        stored
+    }
+
+    pub fn push_item_with_id(&mut self, id: String, item: Item) -> StoredItem {
+        let stored = StoredItem {
+            id,
             created_at: now_millis(),
             item,
         };

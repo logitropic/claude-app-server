@@ -262,12 +262,14 @@ During a turn, the server may emit:
 | Notification | Description |
 | --- | --- |
 | `turn/started` | The turn has started. |
-| `item/progress` | Streaming text or thinking delta. |
-| `item/created` | Finalized text, thinking, tool call, or tool result item. |
-| `usage/update` | Token usage update from Claude stream events. |
+| `thread/started` | The Claude session initialized. |
+| `item/started` | A streamed item started. |
+| `item/agentMessage/delta` | Streaming assistant text delta. |
+| `item/reasoningText/delta` | Streaming reasoning text delta. |
+| `item/completed` | Finalized text, reasoning, or tool call item. |
+| `thread/tokenUsage/updated` | Token usage update from Claude stream events. |
 | `turn/permission_denied` | Claude reported permission denials. |
-| `turn/completed` | The turn completed or was interrupted. |
-| `turn/failed` | The turn failed before completion. |
+| `turn/completed` | The turn completed, was interrupted, or failed. |
 
 ## Claude Invocation
 
@@ -338,7 +340,7 @@ rl.on('line', line => {
       content: 'Respond with exactly CLAUDE_APP_SERVER_SMOKE_OK and nothing else.'
     });
   }
-  if (msg.method === 'turn/completed' || msg.method === 'turn/failed') {
+  if (msg.method === 'turn/completed') {
     child.kill('SIGTERM');
   }
 });

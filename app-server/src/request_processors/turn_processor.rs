@@ -36,7 +36,7 @@ pub async fn turn_start(
         .and_then(Value::as_str)
         .map(ToString::to_string);
 
-    let turn_id = store
+    let (turn_id, turn_snapshot) = store
         .with_thread_mut(&thread_id, |thread| {
             if thread.active_turn_id.is_some() {
                 return Err(JSONRPCError::new(
@@ -46,9 +46,10 @@ pub async fn turn_start(
             }
             let turn = TurnState::new(thread.id.clone(), content);
             let turn_id = turn.id.clone();
+            let turn_snapshot = turn.snapshot();
             thread.active_turn_id = Some(turn_id.clone());
             thread.turns.push(turn);
-            Ok(turn_id)
+            Ok((turn_id, turn_snapshot))
         })
         .await
         .ok_or_else(|| {
@@ -59,8 +60,8 @@ pub async fn turn_start(
         })??;
 
     let notification = TurnStartedNotification {
-        turn_id: turn_id.clone(),
         thread_id: thread_id.clone(),
+        turn: turn_snapshot,
     };
     let _ = outbound_tx
         .send(OutboundControlEvent::Envelope(

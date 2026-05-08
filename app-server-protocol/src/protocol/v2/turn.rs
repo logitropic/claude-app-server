@@ -1,76 +1,76 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use super::item::StoredItem;
+use super::item::ThreadItem;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum TurnStatus {
-    Active,
+    InProgress,
     Completed,
     Interrupted,
-    Error,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnItemsView {
+    NotLoaded,
+    Summary,
+    Full,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnError {
+    pub message: String,
+    pub codex_error_info: Option<String>,
+    #[serde(default)]
+    pub additional_details: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Turn {
     pub id: String,
-    pub thread_id: String,
+    #[serde(default)]
+    pub items: Vec<ThreadItem>,
+    pub items_view: TurnItemsView,
     pub status: TurnStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_content: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<StoredItem>,
-    pub created_at: u128,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<TurnError>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub duration_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnStartResponse {
     pub turn: TurnStartTurn,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnStartTurn {
     pub id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnStartedNotification {
-    pub turn_id: String,
     pub thread_id: String,
+    pub turn: Turn,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnCompletedNotification {
-    pub turn_id: String,
     pub thread_id: String,
-    pub status: TurnStatus,
-    pub items_count: usize,
-    pub completed_at: u128,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cost_usd: Option<f64>,
+    pub turn: Turn,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct TurnFailedNotification {
-    pub turn_id: String,
-    pub error: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct UsageUpdateNotification {
-    pub turn_id: String,
-    pub thread_id: String,
-    pub usage: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnPermissionDeniedNotification {
     pub turn_id: String,
     pub thread_id: String,
