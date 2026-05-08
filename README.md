@@ -204,7 +204,7 @@ Request:
 Response:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"server":{"name":"claude-app-server","version":"0.1.0"},"capabilities":{"threads":["start","resume","fork"],"turns":["start","steer","interrupt"],"models":["claude-opus-4-6","claude-sonnet-4-6","claude-haiku-4-5"],"skills":["Read","Write","Edit","Bash","Glob","Grep","WebFetch","WebSearch","Task"]}}}
+{"jsonrpc":"2.0","id":1,"result":{"server":{"name":"claude-app-server","version":"0.1.1"},"capabilities":{"threads":["start","resume","fork"],"turns":["start","steer","interrupt"],"models":["claude-opus-4-6","claude-sonnet-4-6","claude-haiku-4-5"],"skills":["Read","Write","Edit","Bash","Glob","Grep","WebFetch","WebSearch","Task"]}}}
 ```
 
 Notification:
@@ -375,7 +375,7 @@ Stage packages from a populated vendor tree:
 
 ```bash
 python3 scripts/stage_npm_packages.py \
-  --release-version 0.1.0 \
+  --release-version 0.1.1 \
   --package claude-app-server \
   --vendor-src dist/native/vendor \
   --output-dir dist/npm
@@ -392,9 +392,9 @@ cp target/release/claude-app-server \
   "dist/native/vendor/${TARGET_TRIPLE}/claude-app-server/claude-app-server"
 python3 scripts/build_npm_package.py \
   --package "${PLATFORM_PACKAGE}" \
-  --release-version 0.1.0 \
+  --release-version 0.1.1 \
   --vendor-src dist/native/vendor \
-  --pack-output "dist/npm/${PLATFORM_PACKAGE}-0.1.0.tgz"
+  --pack-output "dist/npm/${PLATFORM_PACKAGE}-0.1.1.tgz"
 ```
 
 ## Compatibility Notes
