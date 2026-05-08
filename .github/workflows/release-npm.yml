@@ -1,0 +1,276 @@
+name: release-npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, for example 0.1.0 or 0.1.0-alpha.1"
+        required: true
+      publish:
+        description: "Publish tarballs to npm"
+        required: true
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*.*.*-alpha.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-native:
+    name: build ${{ matrix.npm_tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - npm_tag: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: claude-app-server
+            setup: sudo apt-get update && sudo apt-get install -y musl-tools
+          - npm_tag: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            binary: claude-app-server
+            setup: sudo apt-get update && sudo apt-get install -y musl-tools
+          - npm_tag: darwin-x64
+            os: macos-13
+            target: x86_64-apple-darwin
+            binary: claude-app-server
+            setup: true
+          - npm_tag: darwin-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            binary: claude-app-server
+            setup: true
+          - npm_tag: win32-x64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: claude-app-server.exe
+            setup: true
+          - npm_tag: win32-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: claude-app-server.exe
+            setup: true
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        shell: bash
+        run: ${{ matrix.setup }}
+
+      - name: Install Rust target
+        shell: bash
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release -p claude-app-server --target ${{ matrix.target }}
+
+      - name: Stage native payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="dist/native/vendor/${{ matrix.target }}/claude-app-server"
+          mkdir -p "$payload"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$payload/${{ matrix.binary }}"
+          chmod +x "$payload/${{ matrix.binary }}" || true
+          tar -czf "dist/native-${{ matrix.npm_tag }}.tar.gz" -C dist/native vendor
+
+      - name: Upload native payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.npm_tag }}
+          path: dist/native-${{ matrix.npm_tag }}.tar.gz
+          if-no-files-found: error
+
+  stage-npm:
+    name: stage npm tarballs
+    needs: build-native
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      npm_tag: ${{ steps.version.outputs.npm_tag }}
+      should_publish: ${{ steps.version.outputs.should_publish }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+            requested_publish="${{ inputs.publish }}"
+          else
+            version="${GITHUB_REF_NAME#v}"
+            requested_publish="true"
+          fi
+
+          if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            npm_tag=""
+            valid_release="true"
+          elif [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
+            npm_tag="alpha"
+            valid_release="true"
+          else
+            npm_tag=""
+            valid_release="false"
+          fi
+
+          if [[ "${requested_publish}" == "true" && "${valid_release}" == "true" ]]; then
+            should_publish="true"
+          else
+            should_publish="false"
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "npm_tag=${npm_tag}" >> "$GITHUB_OUTPUT"
+          echo "should_publish=${should_publish}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download native payloads
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: dist/native-artifacts
+          merge-multiple: true
+
+      - name: Extract native payloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/native
+          for archive in dist/native-artifacts/native-*.tar.gz; do
+            tar -xzf "$archive" -C dist/native
+          done
+
+      - name: Stage npm packages
+        shell: bash
+        run: |
+          python3 scripts/stage_npm_packages.py \
+            --release-version "${{ steps.version.outputs.version }}" \
+            --package claude-app-server \
+            --vendor-src dist/native/vendor \
+            --output-dir dist/npm
+
+      - name: Upload npm tarballs
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarballs
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+
+  publish-npm:
+    name: publish npm
+    needs: stage-npm
+    if: ${{ needs.stage-npm.outputs.should_publish == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+          scope: "@logitropic"
+
+      - name: Download npm tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-tarballs
+          path: dist/npm
+
+      - name: Publish to npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.stage-npm.outputs.version }}
+          NPM_TAG: ${{ needs.stage-npm.outputs.npm_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${NPM_TOKEN}" ]]; then
+            export NODE_AUTH_TOKEN="${NPM_TOKEN}"
+          fi
+
+          prefix=""
+          if [[ -n "${NPM_TAG}" ]]; then
+            prefix="${NPM_TAG}-"
+          fi
+
+          root_tarball="dist/npm/claude-app-server-npm-${VERSION}.tgz"
+          platform_tarballs=(
+            "dist/npm/claude-app-server-npm-linux-x64-${VERSION}.tgz"
+            "dist/npm/claude-app-server-npm-linux-arm64-${VERSION}.tgz"
+            "dist/npm/claude-app-server-npm-darwin-x64-${VERSION}.tgz"
+            "dist/npm/claude-app-server-npm-darwin-arm64-${VERSION}.tgz"
+            "dist/npm/claude-app-server-npm-win32-x64-${VERSION}.tgz"
+            "dist/npm/claude-app-server-npm-win32-arm64-${VERSION}.tgz"
+          )
+
+          for required_tarball in "${platform_tarballs[@]}" "${root_tarball}"; do
+            if [[ ! -f "${required_tarball}" ]]; then
+              echo "Missing npm tarball: ${required_tarball}"
+              exit 1
+            fi
+          done
+
+          tarballs=("${platform_tarballs[@]}" "${root_tarball}")
+          for tarball in "${tarballs[@]}"; do
+            filename="$(basename "${tarball}")"
+            tag=""
+
+            case "${filename}" in
+              claude-app-server-npm-linux-*-"${VERSION}".tgz|claude-app-server-npm-darwin-*-"${VERSION}".tgz|claude-app-server-npm-win32-*-"${VERSION}".tgz)
+                platform="${filename#claude-app-server-npm-}"
+                platform="${platform%-${VERSION}.tgz}"
+                tag="${prefix}${platform}"
+                ;;
+              claude-app-server-npm-"${VERSION}".tgz)
+                tag="${NPM_TAG}"
+                ;;
+              *)
+                echo "Unexpected npm tarball: ${filename}"
+                exit 1
+                ;;
+            esac
+
+            publish_cmd=(npm publish "${GITHUB_WORKSPACE}/${tarball}")
+            if [[ -n "${tag}" ]]; then
+              publish_cmd+=(--tag "${tag}")
+            fi
+
+            echo "+ ${publish_cmd[*]}"
+            set +e
+            publish_output="$("${publish_cmd[@]}" 2>&1)"
+            publish_status=$?
+            set -e
+
+            echo "${publish_output}"
+            if [[ ${publish_status} -eq 0 ]]; then
+              continue
+            fi
+
+            if grep -qiE "previously published|cannot publish over|version already exists" <<< "${publish_output}"; then
+              echo "Skipping already-published package version for ${filename}"
+              continue
+            fi
+
+            exit "${publish_status}"
+          done
