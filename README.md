@@ -257,17 +257,33 @@ Then it streams notifications until the turn completes or fails.
 
 ## Notifications
 
-During a turn, the server may emit:
+During a turn, the server may emit legacy compatibility notifications and richer
+Codex-style notifications.
+
+Legacy notifications:
 
 | Notification | Description |
 | --- | --- |
-| `turn/started` | The turn has started. |
+| `turn/started` | The turn has started. Includes an optional `turn` snapshot. |
 | `item/progress` | Streaming text or thinking delta. |
 | `item/created` | Finalized text, thinking, tool call, or tool result item. |
 | `usage/update` | Token usage update from Claude stream events. |
 | `turn/permission_denied` | Claude reported permission denials. |
-| `turn/completed` | The turn completed or was interrupted. |
+| `turn/completed` | The turn completed or was interrupted. Includes an optional `turn` snapshot. |
 | `turn/failed` | The turn failed before completion. |
+
+Rich notifications:
+
+| Notification | Description |
+| --- | --- |
+| `item/started` | A rich agent message, reasoning item, command execution, or tool call started. |
+| `item/completed` | A rich item completed or failed. |
+| `item/agentMessage/delta` | Streaming assistant text for a rich `agent_message` item. |
+| `item/reasoning/summaryTextDelta` | Streaming thinking text for a rich `reasoning` item. |
+| `item/commandExecution/outputDelta` | Bash command output text from the matching tool result. |
+| `turn/plan/updated` | Plan update derived from Claude `TodoWrite` tool calls. |
+| `hook/started` | Claude CLI hook lifecycle event when emitted by `--include-hook-events`. |
+| `hook/completed` | Claude CLI hook completion event when emitted by `--include-hook-events`. |
 
 ## Claude Invocation
 
@@ -275,6 +291,7 @@ Each turn spawns Claude Code with:
 
 ```text
 claude --print --output-format stream-json --verbose --include-partial-messages \
+  --include-hook-events \
   --permission-mode <mode> \
   --session-id <thread_id>
 ```
